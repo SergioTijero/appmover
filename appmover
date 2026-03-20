@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════╗
+# ║           AppMover — Move apps to SSD        ║
+# ╚══════════════════════════════════════════════╝
+# Mole-style TUI · Arrow keys · Vim bindings
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────
+# Colors & symbols
+# ─────────────────────────────────────────────
+BOLD="\033[1m"
+DIM="\033[2m"
+RESET="\033[0m"
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+WHITE="\033[97m"
+BG_BLUE="\033[44m"
+BG_DARK="\033[48;5;236m"
+
+SYM_OK="✓"
+SYM_ERR="✗"
+SYM_ARROW="▶"
+SYM_DOT="●"
+SYM_LINK="⇢"
+SYM_BACK="⇠"
+SYM_MOVE="⇢"
+
+# ─────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────
+CONFIG_DIR="$HOME/.config/appmover"
+CONFIG_FILE="$CONFIG_DIR/config"
+LOG_FILE="$CONFIG_DIR/appmover.log"
+APPS_DIR="/Applications"
+
+mkdir -p "$CONFIG_DIR"
+touch "$LOG_FILE"
+
+load_config() {
+  SAVED_SSD=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+}
+
+save_config() {
+  echo "SAVED_SSD=\"$SSD_PATH\"" > "$CONFIG_FILE"
+}
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# ─────────────────────────────────────────────
+# Terminal helpers
+# ─────────────────────────────────────────────
+hide_cursor()  { tput civis 2>/dev/null || true; }
+show_cursor()  { tput cnorm 2>/dev/null || true; }
+clear_screen() { tput clear; }
+move_to()      { tput cup "$1" "$2"; }
+save_pos()     { tput sc; }
+restore_pos()  { tput rc; }
+
+cleanup() {
+  show_cursor
+  tput rmcup 2>/dev/null || true
+  echo ""
+}
+trap cleanup EXIT INT TERM
+
+# ─────────────────────────────────────────────
+# Header
+# ─────────────────────────────────────────────
+print_header() {
+  local subtitle="${1:-}"
+  echo -e "${BOLD}${CYAN}"
+  echo "  ╔═══════════════════════════════════════════════╗"
+  echo "  ║   🗂  AppMover  —  Move apps to your SSD      ║"
+  echo "  ╚═══════════════════════════════════════════════╝${RESET}"
+  if [[ -n "$subtitle" ]]; then
+    echo -e "  ${DIM}${subtitle}${RESET}"
+  fi
+  echo ""
+}
+
+print_footer() {
+  echo ""
+  echo -e "  ${DIM}↑↓ Navegar  ·  Space Seleccionar  ·  Enter Confirmar  ·  Q Salir${RESET}"
+}
+
+# ─────────────────────────────────────────────
+# Detect external SSDs / volumes
+# ─────────────────────────────────────────────
+detect_external_disks() {
+  # Returns paths like /Volumes/MySSD
+  local -a disks=()
+  while IFS= read -r vol; do
+    # Skip system volumes
+    [[ "$vol" == "/Volumes/Macintosh HD"* ]] && continue
+    [[ "$vol" == "/Volumes/Preboot"*       ]] && continue
+    [[ "$vol" == "/Volumes/Recovery"*      ]] && continue
+    [[ "$vol" == "/Volumes/VM"*            ]] && continue
+    [[ "$vol" == "/Volumes/Update"*        ]] && continue
+    disks+=("$vol")
+  done < <(find /Volumes -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+  printf '%s\n' "${disks[@]+"${disks[@]}"}"
+}
+
+# ─────────────────────────────────────────────
+# List .app bundles in /Applications
+# ─────────────────────────────────────────────
+list_apps() {
+  local target_dir="$1"   # "internal" or "ssd"
+  local -a apps=()
+
+  if [[ "$target_dir" == "internal" ]]; then
+    # Apps in /Applications that are NOT symlinks
+    while IFS= read -r app; do
+      [[ -L "$app" ]] && continue   # skip symlinks (already moved)
+      apps+=("$app")
+    done < <(find "$APPS_DIR" -maxdepth 1 -name "*.app" 2>/dev/null | sort)
+  else
+    # Apps in SSD Applications folder that have a symlink in /Applications
+    local ssd_apps_dir="$SSD_PATH/Applications"
+    [[ -d "$ssd_apps_dir" ]] || return
+    while IFS= read -r app; do
+      apps+=("$app")
+    done < <(find "$ssd_apps_dir" -maxdepth 1 -name "*.app" 2>/dev/null | sort)
+  fi
+
+  printf '%s\n' "${apps[@]+"${apps[@]}"}"
+}
+
+# Human-readable size
+human_size() {
+  local path="$1"
+  du -sh "$path" 2>/dev/null | awk '{print $1}'
+}
+
+# ─────────────────────────────────────────────
+# Spinner
+# ─────────────────────────────────────────────
+SPINNER_PID=""
+spinner_start() {
+  local msg="$1"
+  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  (
+    local i=0
+    while true; do
+      printf "\r  ${CYAN}%s${RESET} %s " "${frames[$((i % ${#frames[@]}))]}" "$msg"
+      sleep 0.08
+      ((i++)) || true
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+spinner_stop() {
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+    printf "\r\033[K"
+  fi
+}
+
+# ─────────────────────────────────────────────
+# Progress bar
+# ─────────────────────────────────────────────
+progress_bar() {
+  local current="$1"
+  local total="$2"
+  local width=40
+  local pct=$(( current * 100 / total ))
+  local filled=$(( current * width / total ))
+  local empty=$(( width - filled ))
+  local bar
+  bar="$(printf '%0.s█' $(seq 1 $filled 2>/dev/null) 2>/dev/null || printf '%*s' "$filled" '' | tr ' ' '█')"
+  local space
+  space="$(printf '%*s' "$empty" '' | tr ' ' '░')"
+  printf "  ${CYAN}%s%s${RESET}  ${BOLD}%3d%%${RESET}\n" "$bar" "$space" "$pct"
+}
+
+# ─────────────────────────────────────────────
+# Multi-select menu
+# ─────────────────────────────────────────────
+# Usage: multi_select RESULT_VAR "title" item1 item2 ...
+# Returns space-separated indices of selected items
+multi_select() {
+  local -n _result_ref="$1"
+  local title="$2"
+  shift 2
+  local -a items=("$@")
+  local count=${#items[@]}
+  local -a selected=()
+  for (( i=0; i<count; i++ )); do selected+=("0"); done
+
+  local cursor=0
+  hide_cursor
+
+  while true; do
+    clear_screen
+    print_header "$title"
+
+    for (( i=0; i<count; i++ )); do
+      local sel_mark="  ☐"
+      local line_color="$RESET"
+      [[ "${selected[$i]}" == "1" ]] && sel_mark="${GREEN}  ☑${RESET}"
+      if [[ "$i" == "$cursor" ]]; then
+        echo -e "  ${BG_DARK}${BOLD}${WHITE} ${ARROW:-▶} ${sel_mark} ${items[$i]}${RESET}"
+      else
+        echo -e "    ${sel_mark} ${items[$i]}"
+      fi
+    done
+
+    print_footer
+    echo -e "  ${DIM}A Seleccionar todo  ·  N Deseleccionar todo${RESET}"
+
+    # Read key
+    local key
+    IFS= read -r -s -n1 key
+    if [[ "$key" == $'\x1b' ]]; then
+      read -r -s -n2 -t 0.1 key2 || true
+      key="$key$key2"
+    fi
+
+    case "$key" in
+      $'\x1b[A'|'k') (( cursor > 0 )) && (( cursor-- )) || true ;;
+      $'\x1b[B'|'j') (( cursor < count-1 )) && (( cursor++ )) || true ;;
+      ' ')
+        [[ "${selected[$cursor]}" == "1" ]] && selected[$cursor]="0" || selected[$cursor]="1"
+        ;;
+      'a'|'A')
+        for (( i=0; i<count; i++ )); do selected[$i]="1"; done ;;
+      'n'|'N')
+        for (( i=0; i<count; i++ )); do selected[$i]="0"; done ;;
+      ''|$'\n')
+        # Collect selected indices
+        local result_indices=()
+        for (( i=0; i<count; i++ )); do
+          [[ "${selected[$i]}" == "1" ]] && result_indices+=("$i")
+        done
+        _result_ref=("${result_indices[@]+"${result_indices[@]}"}")
+        show_cursor
+        return 0
+        ;;
+      'q'|'Q') show_cursor; exit 0 ;;
+    esac
+  done
+}
+
+# Single-select menu
+single_select() {
+  local -n _ss_result="$1"
+  local title="$2"
+  shift 2
+  local -a items=("$@")
+  local count=${#items[@]}
+  local cursor=0
+  hide_cursor
+
+  while true; do
+    clear_screen
+    print_header "$title"
+
+    for (( i=0; i<count; i++ )); do
+      if [[ "$i" == "$cursor" ]]; then
+        echo -e "  ${BG_DARK}${BOLD}${WHITE} ${SYM_ARROW} ${items[$i]}${RESET}"
+      else
+        echo -e "     ${items[$i]}"
+      fi
+    done
+
+    print_footer
+
+    local key
+    IFS= read -r -s -n1 key
+    if [[ "$key" == $'\x1b' ]]; then
+      read -r -s -n2 -t 0.1 key2 || true
+      key="$key$key2"
+    fi
+
+    case "$key" in
+      $'\x1b[A'|'k') (( cursor > 0 )) && (( cursor-- )) || true ;;
+      $'\x1b[B'|'j') (( cursor < count-1 )) && (( cursor++ )) || true ;;
+      ''|$'\n') _ss_result="$cursor"; show_cursor; return 0 ;;
+      'q'|'Q') show_cursor; exit 0 ;;
+    esac
+  done
+}
+
+# ─────────────────────────────────────────────
+# SSD picker / configurator
+# ─────────────────────────────────────────────
+pick_ssd() {
+  clear_screen
+  print_header "Detectando discos externos..."
+
+  spinner_start "Escaneando volúmenes montados"
+  local -a disks=()
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && disks+=("$d")
+  done < <(detect_external_disks)
+  spinner_stop
+
+  if [[ ${#disks[@]} -eq 0 ]]; then
+    clear_screen
+    print_header
+    echo -e "  ${RED}${SYM_ERR} No se encontraron discos externos montados.${RESET}"
+    echo -e "  ${DIM}Conecta tu SSD y vuelve a intentarlo.${RESET}"
+    echo ""
+    read -r -s -n1 -p "  Presiona cualquier tecla para salir..." || true
+    exit 1
+  fi
+
+  # Build display labels with free space info
+  local -a labels=()
+  for d in "${disks[@]}"; do
+    local free
+    free=$(df -h "$d" 2>/dev/null | awk 'NR==2{print $4}' || echo "?")
+    local name
+    name=$(basename "$d")
+    labels+=("${BOLD}${name}${RESET}  ${DIM}${d}  ·  libre: ${free}${RESET}")
+  done
+
+  local chosen_idx
+  single_select chosen_idx "Selecciona tu SSD de destino" "${labels[@]}"
+  SSD_PATH="${disks[$chosen_idx]}"
+  save_config
+  log "SSD seleccionado: $SSD_PATH"
+
+  # Ensure Apps folder exists on SSD
+  mkdir -p "$SSD_PATH/Applications"
+}
+
+# ─────────────────────────────────────────────
+# Move apps to SSD
+# ─────────────────────────────────────────────
+move_to_ssd() {
+  # Load list of internal apps (not symlinks)
+  clear_screen
+  print_header "Escaneando aplicaciones..."
+
+  spinner_start "Leyendo /Applications"
+  local -a app_paths=()
+  while IFS= read -r a; do
+    [[ -n "$a" ]] && app_paths+=("$a")
+  done < <(list_apps "internal")
+  spinner_stop
+
+  if [[ ${#app_paths[@]} -eq 0 ]]; then
+    clear_screen
+    print_header
+    echo -e "  ${YELLOW}No hay aplicaciones locales para mover.${RESET}"
+    echo -e "  ${DIM}(Puede que todas ya estén en el SSD)${RESET}"
+    echo ""
+    read -r -s -n1 -p "  Presiona cualquier tecla..." || true
+    return
+  fi
+
+  # Build labels with sizes (async for speed)
+  clear_screen
+  print_header "Calculando tamaños..."
+  spinner_start "Midiendo aplicaciones (puede tardar unos segundos)"
+
+  local -a labels=()
+  for app in "${app_paths[@]}"; do
+    local size
+    size=$(human_size "$app")
+    local name
+    name=$(basename "$app" .app)
+    labels+=("${BOLD}${name}${RESET}  ${DIM}${size}${RESET}")
+  done
+  spinner_stop
+
+  # Multi-select
+  local -a chosen_indices=()
+  multi_select chosen_indices "Selecciona apps para mover al SSD  [${CYAN}${SSD_PATH}${RESET}]" "${labels[@]}"
+
+  if [[ ${#chosen_indices[@]} -eq 0 ]]; then
+    clear_screen
+    print_header
+    echo -e "  ${YELLOW}Ninguna app seleccionada.${RESET}"
+    sleep 1
+    return
+  fi
+
+  # Confirm
+  clear_screen
+  print_header "Confirmar operación"
+  echo -e "  ${BOLD}Aplicaciones a mover:${RESET}"
+  echo ""
+  local total_count=${#chosen_indices[@]}
+  for idx in "${chosen_indices[@]}"; do
+    local app="${app_paths[$idx]}"
+    local name size
+    name=$(basename "$app" .app)
+    size=$(human_size "$app")
+    echo -e "    ${SYM_MOVE} ${BOLD}${name}${RESET}  ${DIM}${size}${RESET}"
+  done
+  echo ""
+  echo -e "  ${DIM}Destino: ${SSD_PATH}/Applications${RESET}"
+  echo -e "  ${DIM}Se crearán symlinks para que las apps sigan funcionando.${RESET}"
+  echo ""
+  echo -e "  ${YELLOW}${BOLD}¿Continuar? (s/N)${RESET} "
+  local confirm
+  read -r -s -n1 confirm
+  [[ "$confirm" != "s" && "$confirm" != "S" ]] && return
+
+  # Execute moves
+  clear_screen
+  print_header "Moviendo aplicaciones..."
+  echo ""
+
+  local done_count=0
+  local errors=()
+
+  for idx in "${chosen_indices[@]}"; do
+    local app="${app_paths[$idx]}"
+    local name dest_app
+    name=$(basename "$app" .app)
+    dest_app="$SSD_PATH/Applications/$(basename "$app")"
+
+    printf "  ${CYAN}${SYM_ARROW}${RESET} Moviendo ${BOLD}%s${RESET}...\n" "$name"
+    progress_bar "$done_count" "$total_count"
+
+    if rsync -a --remove-source-files "$app/" "$dest_app/" 2>>"$LOG_FILE"; then
+      # Remove original empty shell
+      rm -rf "$app" 2>>"$LOG_FILE" || true
+      # Create symlink
+      ln -sf "$dest_app" "$app" 2>>"$LOG_FILE"
+      # Move up and overwrite progress
+      tput cuu1; tput el
+      tput cuu1; tput el
+      printf "  ${GREEN}${SYM_OK}${RESET} ${BOLD}%s${RESET}  ${DIM}→ SSD${RESET}\n" "$name"
+      log "Movida: $app → $dest_app (symlink creado)"
+    else
+      tput cuu1; tput el
+      tput cuu1; tput el
+      printf "  ${RED}${SYM_ERR}${RESET} ${BOLD}%s${RESET}  ${DIM}Error al mover${RESET}\n" "$name"
+      errors+=("$name")
+      log "ERROR moviendo: $app"
+    fi
+
+    (( done_count++ )) || true
+  done
+
+  echo ""
+  progress_bar "$total_count" "$total_count"
+  echo ""
+  echo -e "  ${BOLD}══════════════════════════════════════════════════════${RESET}"
+  echo -e "  ${GREEN}${SYM_OK}${RESET} ${BOLD}${done_count} app(s) procesadas${RESET}"
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    echo -e "  ${RED}${SYM_ERR} Errores: ${errors[*]}${RESET}"
+    echo -e "  ${DIM}Ver detalles en: ${LOG_FILE}${RESET}"
+  fi
+  echo -e "  ${BOLD}══════════════════════════════════════════════════════${RESET}"
+  echo ""
+  read -r -s -n1 -p "  Presiona cualquier tecla para continuar..." || true
+}
+
+# ─────────────────────────────────────────────
+# Restore apps from SSD back to internal
+# ─────────────────────────────────────────────
+restore_from_ssd() {
+  clear_screen
+  print_header "Escaneando apps en SSD..."
+
+  local ssd_apps_dir="$SSD_PATH/Applications"
+  if [[ ! -d "$ssd_apps_dir" ]]; then
+    echo -e "  ${YELLOW}No hay carpeta Applications en el SSD.${RESET}"
+    sleep 2; return
+  fi
+
+  spinner_start "Leyendo $ssd_apps_dir"
+  local -a app_paths=()
+  while IFS= read -r a; do
+    [[ -n "$a" ]] && app_paths+=("$a")
+  done < <(find "$ssd_apps_dir" -maxdepth 1 -name "*.app" 2>/dev/null | sort)
+  spinner_stop
+
+  if [[ ${#app_paths[@]} -eq 0 ]]; then
+    clear_screen
+    print_header
+    echo -e "  ${YELLOW}No hay aplicaciones en el SSD para restaurar.${RESET}"
+    read -r -s -n1 -p "  Presiona cualquier tecla..." || true
+    return
+  fi
+
+  local -a labels=()
+  for app in "${app_paths[@]}"; do
+    local size name
+    name=$(basename "$app" .app)
+    size=$(human_size "$app")
+    # Check if symlink exists
+    local internal_path="$APPS_DIR/$(basename "$app")"
+    local status_tag=""
+    [[ -L "$internal_path" ]] && status_tag="${DIM} [symlink activo]${RESET}"
+    labels+=("${BOLD}${name}${RESET}  ${DIM}${size}${RESET}${status_tag}")
+  done
+
+  local -a chosen_indices=()
+  multi_select chosen_indices "Selecciona apps para restaurar al disco interno" "${labels[@]}"
+
+  [[ ${#chosen_indices[@]} -eq 0 ]] && return
+
+  # Confirm
+  clear_screen
+  print_header "Confirmar restauración"
+  echo -e "  ${BOLD}Apps a restaurar:${RESET}"
+  echo ""
+  for idx in "${chosen_indices[@]}"; do
+    local name
+    name=$(basename "${app_paths[$idx]}" .app)
+    echo -e "    ${SYM_BACK} ${BOLD}${name}${RESET}"
+  done
+  echo ""
+  echo -e "  ${YELLOW}${BOLD}¿Continuar? (s/N)${RESET} "
+  local confirm
+  read -r -s -n1 confirm
+  [[ "$confirm" != "s" && "$confirm" != "S" ]] && return
+
+  clear_screen
+  print_header "Restaurando aplicaciones..."
+  echo ""
+
+  local done_count=0 total_count=${#chosen_indices[@]}
+  local errors=()
+
+  for idx in "${chosen_indices[@]}"; do
+    local ssd_app="${app_paths[$idx]}"
+    local name internal_path
+    name=$(basename "$ssd_app" .app)
+    internal_path="$APPS_DIR/$(basename "$ssd_app")"
+
+    printf "  ${CYAN}${SYM_ARROW}${RESET} Restaurando ${BOLD}%s${RESET}...\n" "$name"
+    progress_bar "$done_count" "$total_count"
+
+    # Remove symlink if exists
+    [[ -L "$internal_path" ]] && rm "$internal_path"
+
+    if rsync -a --remove-source-files "$ssd_app/" "$internal_path/" 2>>"$LOG_FILE"; then
+      rm -rf "$ssd_app" 2>>"$LOG_FILE" || true
+      tput cuu1; tput el; tput cuu1; tput el
+      printf "  ${GREEN}${SYM_OK}${RESET} ${BOLD}%s${RESET}  ${DIM}→ Disco interno${RESET}\n" "$name"
+      log "Restaurada: $ssd_app → $internal_path"
+    else
+      tput cuu1; tput el; tput cuu1; tput el
+      printf "  ${RED}${SYM_ERR}${RESET} ${BOLD}%s${RESET}  ${DIM}Error${RESET}\n" "$name"
+      errors+=("$name")
+      log "ERROR restaurando: $ssd_app"
+    fi
+    (( done_count++ )) || true
+  done
+
+  echo ""
+  progress_bar "$total_count" "$total_count"
+  echo ""
+  echo -e "  ${GREEN}${SYM_OK} ${BOLD}${done_count} app(s) restauradas${RESET}"
+  [[ ${#errors[@]} -gt 0 ]] && echo -e "  ${RED}${SYM_ERR} Errores: ${errors[*]}${RESET}"
+  echo ""
+  read -r -s -n1 -p "  Presiona cualquier tecla para continuar..." || true
+}
+
+# ─────────────────────────────────────────────
+# Status overview
+# ─────────────────────────────────────────────
+show_status() {
+  clear_screen
+  print_header "Estado actual"
+
+  # Internal disk
+  local int_free int_total int_used_pct
+  int_free=$(df -h / 2>/dev/null | awk 'NR==2{print $4}')
+  int_total=$(df -h / 2>/dev/null | awk 'NR==2{print $2}')
+  int_used_pct=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,""); print $5}')
+
+  echo -e "  ${BOLD}💾 Disco Interno${RESET}"
+  echo -e "  Libre: ${GREEN}${int_free}${RESET}  /  Total: ${int_total}"
+  local filled_int=$(( int_used_pct * 30 / 100 ))
+  local bar_int
+  bar_int="$(printf '%*s' "$filled_int" '' | tr ' ' '█')$(printf '%*s' "$((30-filled_int))" '' | tr ' ' '░')"
+  echo -e "  ${CYAN}${bar_int}${RESET}  ${BOLD}${int_used_pct}%${RESET} usado"
+  echo ""
+
+  # SSD disk
+  if [[ -n "$SSD_PATH" && -d "$SSD_PATH" ]]; then
+    local ssd_free ssd_total ssd_used_pct
+    ssd_free=$(df -h "$SSD_PATH" 2>/dev/null | awk 'NR==2{print $4}')
+    ssd_total=$(df -h "$SSD_PATH" 2>/dev/null | awk 'NR==2{print $2}')
+    ssd_used_pct=$(df "$SSD_PATH" 2>/dev/null | awk 'NR==2{gsub(/%/,""); print $5}')
+    local vol_name
+    vol_name=$(basename "$SSD_PATH")
+
+    echo -e "  ${BOLD}📦 SSD — ${vol_name}${RESET}"
+    echo -e "  Libre: ${GREEN}${ssd_free}${RESET}  /  Total: ${ssd_total}"
+    local filled_ssd=$(( ssd_used_pct * 30 / 100 ))
+    local bar_ssd
+    bar_ssd="$(printf '%*s' "$filled_ssd" '' | tr ' ' '█')$(printf '%*s' "$((30-filled_ssd))" '' | tr ' ' '░')"
+    echo -e "  ${CYAN}${bar_ssd}${RESET}  ${BOLD}${ssd_used_pct}%${RESET} usado"
+    echo ""
+
+    # Apps already on SSD
+    local ssd_app_count
+    ssd_app_count=$(find "$SSD_PATH/Applications" -maxdepth 1 -name "*.app" 2>/dev/null | wc -l | tr -d ' ')
+    local int_app_count
+    int_app_count=$(find "$APPS_DIR" -maxdepth 1 -name "*.app" ! -type l 2>/dev/null | wc -l | tr -d ' ')
+
+    echo -e "  ${BOLD}📱 Aplicaciones${RESET}"
+    echo -e "  ${SYM_DOT} En disco interno:  ${BOLD}${int_app_count}${RESET} apps"
+    echo -e "  ${SYM_DOT} En SSD:            ${BOLD}${ssd_app_count}${RESET} apps (con symlink)"
+  else
+    echo -e "  ${DIM}SSD no configurado. Usa 'Cambiar SSD' en el menú principal.${RESET}"
+  fi
+
+  echo ""
+  read -r -s -n1 -p "  Presiona cualquier tecla para volver..." || true
+}
+
+# ─────────────────────────────────────────────
+# Main menu
+# ─────────────────────────────────────────────
+main_menu() {
+  local -a menu_items=(
+    "${SYM_MOVE}  Mover apps al SSD"
+    "${SYM_BACK}  Restaurar apps al disco interno"
+    "${SYM_DOT}   Ver estado de discos y apps"
+    "⚙   Cambiar SSD de destino"
+    "📋  Ver log de operaciones"
+    "✕   Salir"
+  )
+
+  local choice
+  single_select choice "SSD: ${SSD_PATH:-'(no configurado)'}  ·  Vim keys: j/k" "${menu_items[@]}"
+
+  case "$choice" in
+    0) move_to_ssd ;;
+    1) restore_from_ssd ;;
+    2) show_status ;;
+    3) pick_ssd ;;
+    4)
+      clear_screen
+      print_header "Log reciente"
+      echo ""
+      tail -n 30 "$LOG_FILE" | while IFS= read -r line; do
+        echo "  $line"
+      done
+      echo ""
+      read -r -s -n1 -p "  Presiona cualquier tecla..." || true
+      ;;
+    5) exit 0 ;;
+  esac
+}
+
+# ─────────────────────────────────────────────
+# Entrypoint
+# ─────────────────────────────────────────────
+main() {
+  # Alternate screen
+  tput smcup 2>/dev/null || true
+
+  load_config
+
+  # If SSD not set, pick one first
+  if [[ -z "$SAVED_SSD" ]]; then
+    pick_ssd
+  else
+    SSD_PATH="$SAVED_SSD"
+    # Validate it's still mounted
+    if [[ ! -d "$SSD_PATH" ]]; then
+      clear_screen
+      print_header
+      echo -e "  ${YELLOW}⚠  El SSD '${SSD_PATH}' ya no está montado.${RESET}"
+      echo -e "  ${DIM}Selecciona otro volumen.${RESET}"
+      echo ""
+      sleep 2
+      pick_ssd
+    fi
+  fi
+
+  # Main loop
+  while true; do
+    main_menu
+  done
+}
+
+# CLI flags
+case "${1:-}" in
+  --help|-h)
+    echo "AppMover — Mueve apps de macOS al SSD"
+    echo ""
+    echo "  appmover              Menú interactivo"
+    echo "  appmover --status     Ver estado de discos"
+    echo "  appmover --log        Ver log de operaciones"
+    echo "  appmover --help       Esta ayuda"
+    exit 0
+    ;;
+  --status)
+    load_config
+    SSD_PATH="${SAVED_SSD:-}"
+    show_status
+    exit 0
+    ;;
+  --log)
+    cat "$LOG_FILE"
+    exit 0
+    ;;
+  *)
+    main
+    ;;
+esac
