@@ -71,9 +71,10 @@ log() {
 # ─────────────────────────────────────────────
 # Terminal helpers
 # ─────────────────────────────────────────────
-hide_cursor()  { tput civis 2>/dev/null || true; }
-show_cursor()  { tput cnorm 2>/dev/null || true; }
-clear_screen() { tput clear 2>/dev/null || true; }
+hide_cursor()  { tput civis 2>/dev/null || printf '\033[?25l'; }
+show_cursor()  { tput cnorm 2>/dev/null || printf '\033[?25h'; }
+# Use ANSI directly — tput clear can return exit 2 on some setups
+clear_screen() { printf '\033[H\033[2J'; }
 
 cleanup() {
   show_cursor
@@ -283,22 +284,29 @@ multi_select() {
     print_footer
     echo -e "  ${DIM}A Seleccionar todo  ·  N Deseleccionar todo${RESET}"
 
-    local key key2
-    IFS= read -r -s -n1 key
+    local key=""
+    local key2=""
+    IFS= read -r -s -n1 key || true
     if [[ "$key" == $'\x1b' ]]; then
-      read -r -s -n2 -t 0.1 key2 || true
+      IFS= read -r -s -n2 -t 0.1 key2 || true
       key="$key$key2"
     fi
 
     case "$key" in
-      $'\x1b[A'|'k') (( cursor > 0 )) && cursor=$(( cursor - 1 )) || true ;;
-      $'\x1b[B'|'j') (( cursor < count-1 )) && cursor=$(( cursor + 1 )) || true ;;
+      $'\x1b[A'|'k')
+        if (( cursor > 0 )); then cursor=$(( cursor - 1 )); fi ;;
+      $'\x1b[B'|'j')
+        if (( cursor < count - 1 )); then cursor=$(( cursor + 1 )); fi ;;
       ' ')
-        [[ "${selected[$cursor]}" == "1" ]] && selected[$cursor]="0" || selected[$cursor]="1"
+        if [[ "${selected[$cursor]}" == "1" ]]; then
+          selected[$cursor]="0"
+        else
+          selected[$cursor]="1"
+        fi
         ;;
       'a'|'A') for (( i=0; i<count; i++ )); do selected[$i]="1"; done ;;
       'n'|'N') for (( i=0; i<count; i++ )); do selected[$i]="0"; done ;;
-      ''|$'\n')
+      ''|$'\n'|$'\r')
         MULTI_RESULT=()
         for (( i=0; i<count; i++ )); do
           [[ "${selected[$i]}" == "1" ]] && MULTI_RESULT+=("$i")
@@ -339,17 +347,20 @@ single_select() {
 
     print_footer
 
-    local key key2
-    IFS= read -r -s -n1 key
+    local key=""
+    local key2=""
+    IFS= read -r -s -n1 key || true
     if [[ "$key" == $'\x1b' ]]; then
-      read -r -s -n2 -t 0.1 key2 || true
+      IFS= read -r -s -n2 -t 0.1 key2 || true
       key="$key$key2"
     fi
 
     case "$key" in
-      $'\x1b[A'|'k') (( cursor > 0 )) && cursor=$(( cursor - 1 )) || true ;;
-      $'\x1b[B'|'j') (( cursor < count-1 )) && cursor=$(( cursor + 1 )) || true ;;
-      ''|$'\n') MENU_RESULT="$cursor"; show_cursor; return 0 ;;
+      $'\x1b[A'|'k')
+        if (( cursor > 0 )); then cursor=$(( cursor - 1 )); fi ;;
+      $'\x1b[B'|'j')
+        if (( cursor < count - 1 )); then cursor=$(( cursor + 1 )); fi ;;
+      ''|$'\n'|$'\r') MENU_RESULT="$cursor"; show_cursor; return 0 ;;
       'q'|'Q') show_cursor; exit 0 ;;
     esac
   done
