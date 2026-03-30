@@ -52,11 +52,9 @@ macOS applications can be surprisingly large — Xcode alone is 15 GB. When your
 | Requirement | Details |
 |---|---|
 | macOS | 11 Big Sur or later |
-| Bash | **4.3 or later** — install via Homebrew: `brew install bash` |
+| Bash | 3.2+ (the version included with macOS — no extra install needed) |
 | rsync | Included in macOS |
 | External volume | SSD mounted under `/Volumes/` |
-
-> **Note:** macOS ships with Bash 3.2, which is too old. AppMover uses [namerefs](https://www.gnu.org/software/bash/manual/bash.html#Shell-Parameters) (`local -n`) that require Bash 4.3+. Install a modern Bash with Homebrew once and you're set.
 
 ---
 
@@ -155,9 +153,6 @@ The symlink still exists but the SSD isn't mounted. Reconnect the SSD, or run `a
 
 **"Permission denied" when moving system apps**
 Some apps in `/Applications` are write-protected by macOS. Try running with `sudo appmover`, or skip those apps and move them manually.
-
-**`local: -n: invalid option` error**
-Your shell is using macOS's built-in Bash 3.2. Install Bash 4+ via Homebrew (`brew install bash`) and ensure `/usr/local/bin/bash` (or `/opt/homebrew/bin/bash`) comes first in your `PATH`.
 
 **Terminal rendering issues (iTerm2)**
 iTerm2 may misrender some Unicode block characters. Alacritty, kitty, WezTerm, Ghostty, and Warp all render correctly.
