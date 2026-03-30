@@ -19,12 +19,7 @@ echo -e "${BOLD}${CYAN}  AppMover — Instalador${RESET}"
 echo -e "  ${BOLD}═══════════════════════${RESET}"
 echo ""
 
-# Verify Bash version (requires 4.3+ for namerefs)
-if (( BASH_VERSINFO[0] < 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3 ) )); then
-  echo -e "  ${YELLOW}⚠  Bash ${BASH_VERSION} detectado.${RESET}"
-  echo -e "  ${DIM}AppMover requiere Bash 4.3+. Instálalo con: brew install bash${RESET}"
-  echo ""
-fi
+echo -e "  ${DIM}Bash ${BASH_VERSION}${RESET}"
 
 # Detect script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
